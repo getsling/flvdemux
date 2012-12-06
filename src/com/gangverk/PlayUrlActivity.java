@@ -54,7 +54,6 @@ public class PlayUrlActivity extends Activity {
 		urlText = (EditText)findViewById(R.id.urltext);
 		playButton = (Button) findViewById(R.id.playbutton);
 		stopButton = (Button) findViewById(R.id.stopbutton);
-		urlText.setText("http://208.92.55.49/KROQFM?streamtheworld_user=1&SRC=CBS&DIST=CBS&TGT=Android");
 		playButton.setOnClickListener(clickListener);
 		stopButton.setOnClickListener(clickListener);
 	}
