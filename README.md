@@ -1,7 +1,7 @@
 flvdemux
 ========
 
-This is a little demo app wrapping the FLVDemuxingInputStream
+This is a little demo Android app wrapping the FLVDemuxingInputStream
 
 FLVDemuxingInputStream.java is based almost entirely on trevlovett's FlashAACInputStream
 
