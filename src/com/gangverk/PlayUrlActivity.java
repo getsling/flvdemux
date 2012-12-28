@@ -1,13 +1,10 @@
 package com.gangverk;
 
-import java.io.File;
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLConnection;
 import java.util.Properties;
-
-import com.gangverk.NanoHTTPD.Response;
 
 
 import android.media.MediaPlayer;
@@ -27,7 +24,8 @@ public class PlayUrlActivity extends Activity {
 	private EditText urlText;
 	
 	private NanoHTTPD server = null;
-	private MediaPlayer player = null;
+	private NativeAudio player = null;
+	private AudioPlayer ffmpegplayer = null;
 	
 	private static final int HTTP_CONNECTION_TIMEOUT = 80000;
 	private static final int HTTP_SOCKET_TIMEOUT = 100000;
@@ -41,21 +39,25 @@ public class PlayUrlActivity extends Activity {
 			@Override
 			public void onClick(View v) {
 				if(v == playButton){
-					if(server != null){
-						stop();
+					if(ffmpegplayer != null){
+						stopffmpeg();
 					}
-					start(urlText.getText().toString());
+					startffmpeg(urlText.getText().toString());
 				}else if (v == stopButton){
-					stop();
+					stopffmpeg();
 				}
 			}		
 		};
 
 		urlText = (EditText)findViewById(R.id.urltext);
+		urlText.setText("http://77.67.109.135/KROQFMAAC?streamtheworld_user=1&SRC=CBS&DIST=CBS&TGT=Android");
+		//urlText.setText("http://208.92.55.49/KROQFM?streamtheworld_user=1&SRC=CBS&DIST=CBS&TGT=Android");
 		playButton = (Button) findViewById(R.id.playbutton);
 		stopButton = (Button) findViewById(R.id.stopbutton);
 		playButton.setOnClickListener(clickListener);
 		stopButton.setOnClickListener(clickListener);
+		
+		AudioPlayer.loadLibrary(this);
 	}
 	
 	private void start(final String url){
@@ -90,7 +92,7 @@ public class PlayUrlActivity extends Activity {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
-		player = new MediaPlayer();
+		player = new NativeAudio();
 		
 		try {
 			player.setDataSource("http://localhost:8080");
@@ -105,15 +107,47 @@ public class PlayUrlActivity extends Activity {
 		} catch (IllegalStateException e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
-		} catch (IOException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
+		} 
 		
 	}
 	private void stop(){
 		player.stop();
 		server.stop();	
+	}
+	private void startffmpeg(final String url){
+		
+		ffmpegplayer = new AudioPlayer();
+		
+		Thread prepareThread = new Thread(new Runnable(){
+			@Override
+			public void run() {
+				try {
+					URL urlToGet = new URL(url);
+					URLConnection connection = urlToGet.openConnection();
+					connection.setConnectTimeout(HTTP_CONNECTION_TIMEOUT);
+					connection.setReadTimeout(HTTP_SOCKET_TIMEOUT);
+					
+					FLVDemuxingInputStream in = new FLVDemuxingInputStream(connection.getInputStream());
+					
+					ffmpegplayer.setDataSource(in);
+					ffmpegplayer.prepare();
+					ffmpegplayer.start();
+					
+				} catch (MalformedURLException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				} catch (IOException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			}
+		});
+		prepareThread.start();
+		
+		
+	}
+	private void stopffmpeg(){
+		ffmpegplayer.stop();
 	}
 
 	@Override
