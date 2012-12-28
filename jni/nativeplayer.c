@@ -71,32 +71,69 @@ uint8_t aacData[AUDIO_INBUF_SIZE];
 #define ANDROID_MODULE "nativeplayer"
 #define ANDROID_LOG(...) \
     __android_log_print(ANDROID_LOG_VERBOSE, ANDROID_MODULE, __VA_ARGS__)
+ 
+/* Opaque buffer element type.  This would be defined by the application. */
+typedef struct { uint8_t m[1024]; } ElemType;
+ 
+/* Circular buffer object */
+typedef struct {
+    int         size;   /* maximum number of elements           */
+    int         start;  /* index of oldest element              */
+    int         end;    /* index at which to write new element  */
+    int         s_msb;
+    int         e_msb;
+    ElemType   *elems;  /* vector of elements                   */
+} CircularBuffer;
+ 
+void cbInit(CircularBuffer *cb, int size, int ) {
+    cb->size  = size;
+    cb->start = 0;
+    cb->end   = 0;
+    cb->s_msb = 0;
+    cb->e_msb = 0;
+    cb->elems = (ElemType *)calloc(cb->size, sizeof(ElemType));
+    printf("created with %u elements of size %lu\n",cb->size, sizeof(ElemType));
+}
+void cbFree(CircularBuffer *cb) {
+    free(cb->elems); /* OK if null */ }
+ 
+
+void cbPrint(CircularBuffer *cb) {
+    printf("size=0x%x, start=%d, end=%d\n", cb->size, cb->start, cb->end);
+}
+ 
+int cbIsFull(CircularBuffer *cb) {
+    return cb->end == cb->start && cb->e_msb != cb->s_msb; }
+ 
+int cbIsEmpty(CircularBuffer *cb) {
+    return cb->end == cb->start && cb->e_msb == cb->s_msb; }
+ 
+void cbIncr(CircularBuffer *cb, int *p, int *msb) {
+    *p = *p + 1;
+    if (*p == cb->size) {
+        *msb ^= 1;
+        *p = 0;
+    }
+}
+ 
+void cbWrite(CircularBuffer *cb, ElemType *elem) {
+    cb->elems[cb->end] = *elem;
+    if (cbIsFull(cb)) /* full, overwrite moves start pointer */
+        cbIncr(cb, &cb->start, &cb->s_msb);
+    cbIncr(cb, &cb->end, &cb->e_msb);
+}
+ 
+void cbRead(CircularBuffer *cb, ElemType *elem) {
+    *elem = cb->elems[cb->start];
+    cbIncr(cb, &cb->start, &cb->s_msb);
+}
+
 
 typedef struct Decoder{
-	int stopped;
-	JNIEnv* env;
-	jobject thiz;
-	//java callbacks
-	jmethodID pull;
-	jmethodID push;
-	//java buffer for audio output
-	jbyte* audiobuffer;
-	//java buffer for audio input
-	jbyte* databuffer;
-
-    //c buffer for audio input
-    uint8_t* datasrc;
-    uint8_t* datasrc_ptr;
-    int datasrc_size;
-
-    //c buffer for audio output
-    uint8_t* datasink;
-    uint8_t* datasink_ptr;
-
-	//timer for interrupt on blocking read
-	clock_t block_start;
+    int stopped;
+    CircularBuffer* inputbuffer;
+    CircularBuffer* outputbuffer;
 } Decoder;
-
 
 
 //always try to fill whatever is left in decoder->datasrc
@@ -425,7 +462,7 @@ JNIEXPORT jint JNICALL Java_com_gangverk_AudioPlayer_startDecoding
         goto fail;
     }
     //Hang around to perform push pull from java as possible
-    
+
     /* ------------------------------------------------------ */
     /* End of decoding */
     return retval;
