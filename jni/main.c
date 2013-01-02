@@ -22,11 +22,9 @@ int main(int argc, char **argv) {
       }
     }
     char *tail;
-    
 
     while(tail = (char*)TPCircularBufferTail(&cb,&available_bytes)){
-      
-      printf("%d\n",tail[0]);
+      printf("%d:%d\n",tail[0],tail[1]);
       TPCircularBufferConsume(&cb,100);      
     }
 

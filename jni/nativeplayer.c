@@ -3,6 +3,12 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+
 #include <android/log.h>
 
 
@@ -10,43 +16,7 @@
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 
-// engine interfaces
-static SLObjectItf engineObject = NULL;
-static SLEngineItf engineEngine;
 
-// output mix interfaces
-static SLObjectItf outputMixObject = NULL;
-static SLEnvironmentalReverbItf outputMixEnvironmentalReverb = NULL;
-
-// buffer queue player interfaces
-static SLObjectItf bqPlayerObject = NULL;
-static SLPlayItf bqPlayerPlay;
-static SLAndroidSimpleBufferQueueItf bqPlayerBufferQueue;
-static SLEffectSendItf bqPlayerEffectSend;
-static SLMuteSoloItf bqPlayerMuteSolo;
-static SLVolumeItf bqPlayerVolume;
-
-// aux effect on the output mix, used by the buffer queue player
-static const SLEnvironmentalReverbSettings reverbSettings =
-    SL_I3DL2_ENVIRONMENT_PRESET_STONECORRIDOR;
-
-// URI player interfaces
-static SLAndroidSimpleBufferQueueItf decBuffQueueItf;
-static SLObjectItf uriPlayerObject = NULL;
-static SLPlayItf uriPlayerPlay;
-static SLSeekItf uriPlayerSeek;
-static SLMuteSoloItf uriPlayerMuteSolo;
-static SLVolumeItf uriPlayerVolume;
-
-
-// pointer and size of the next player buffer to enqueue, and number of remaining buffers
-static short *nextBuffer;
-static unsigned nextSize;
-static int nextCount;
-
-
-
-#define INBUF_SIZE 4096
 #define AUDIO_INBUF_SIZE 32768
 #define AUDIO_REFILL_THRESH 4096
 #define AUDIO_OUTBUF_SIZE 65536
@@ -63,76 +33,143 @@ static int nextCount;
 /* Size of each PCM buffer in the queue */
 #define BUFFER_SIZE_IN_BYTES   (2*sizeof(short)*SAMPLES_PER_AAC_FRAME)
 
-/* Local storage for decoded PCM audio data */
-int8_t pcmData[NB_BUFFERS_IN_PCM_QUEUE * BUFFER_SIZE_IN_BYTES];
-uint8_t aacData[AUDIO_INBUF_SIZE];
-
 
 #define ANDROID_MODULE "nativeplayer"
 #define ANDROID_LOG(...) \
     __android_log_print(ANDROID_LOG_VERBOSE, ANDROID_MODULE, __VA_ARGS__)
  
-/* Opaque buffer element type.  This would be defined by the application. */
-typedef struct { uint8_t m[1024]; } ElemType;
+void report_exceptional_condition(int i){
+    ANDROID_LOG("exceptional condition %d %s",i,strerror( errno ));
+} 
  
-/* Circular buffer object */
-typedef struct {
-    int         size;   /* maximum number of elements           */
-    int         start;  /* index of oldest element              */
-    int         end;    /* index at which to write new element  */
-    int         s_msb;
-    int         e_msb;
-    ElemType   *elems;  /* vector of elements                   */
-} CircularBuffer;
+typedef struct
+{
+  void *address;
  
-void cbInit(CircularBuffer *cb, int size, int ) {
-    cb->size  = size;
-    cb->start = 0;
-    cb->end   = 0;
-    cb->s_msb = 0;
-    cb->e_msb = 0;
-    cb->elems = (ElemType *)calloc(cb->size, sizeof(ElemType));
-    printf("created with %u elements of size %lu\n",cb->size, sizeof(ElemType));
-}
-void cbFree(CircularBuffer *cb) {
-    free(cb->elems); /* OK if null */ }
+  unsigned long count_bytes;
+  unsigned long write_offset_bytes;
+  unsigned long read_offset_bytes;
+} ring_buffer;
  
+//Warning order should be at least 12 for Linux
+void
+ring_buffer_create ( ring_buffer *buffer, unsigned long order)
+{
+  char path[] = "/sdcard/ rbXXXXXX";
+  int file_descriptor;
+  void *address;
+  int status;
+ 
+  file_descriptor = mkstemp (path);
+  if (file_descriptor < 0)
+    report_exceptional_condition (1);  
+  status = unlink (path);
+  if (status)
+    report_exceptional_condition (2);
 
-void cbPrint(CircularBuffer *cb) {
-    printf("size=0x%x, start=%d, end=%d\n", cb->size, cb->start, cb->end);
+  buffer->count_bytes = 1UL << order;
+  buffer->write_offset_bytes = 0;
+  buffer->read_offset_bytes = 0;
+ 
+  status = ftruncate (file_descriptor, buffer->count_bytes);
+  if (status)
+    report_exceptional_condition (3);
+ 
+  buffer->address = mmap (NULL, buffer->count_bytes << 1, PROT_NONE,
+                          MAP_ANON | MAP_PRIVATE, -1, 0);
+ 
+  if (buffer->address == MAP_FAILED)
+    report_exceptional_condition (4);
+  
+  address =
+    mmap (buffer->address, buffer->count_bytes, PROT_READ | PROT_WRITE,
+          MAP_FIXED | MAP_SHARED, file_descriptor, 0);
+ 
+  if (address != buffer->address)
+    report_exceptional_condition (5);
+  
+  address = mmap (buffer->address + buffer->count_bytes,
+                  buffer->count_bytes, PROT_READ | PROT_WRITE,
+                  MAP_FIXED | MAP_SHARED, file_descriptor, 0);
+ 
+  if (address != buffer->address + buffer->count_bytes)
+    report_exceptional_condition (6);
+  status = close (file_descriptor);
+  if (status)
+    report_exceptional_condition (7);
 }
  
-int cbIsFull(CircularBuffer *cb) {
-    return cb->end == cb->start && cb->e_msb != cb->s_msb; }
+void
+ring_buffer_free ( ring_buffer *buffer)
+{
+  int status;
  
-int cbIsEmpty(CircularBuffer *cb) {
-    return cb->end == cb->start && cb->e_msb == cb->s_msb; }
+  status = munmap (buffer->address, buffer->count_bytes << 1);
+  if (status)
+    report_exceptional_condition (0);
+}
  
-void cbIncr(CircularBuffer *cb, int *p, int *msb) {
-    *p = *p + 1;
-    if (*p == cb->size) {
-        *msb ^= 1;
-        *p = 0;
+void *
+ring_buffer_write_address ( ring_buffer *buffer)
+{
+  // ****** void pointer arithmetic is a constraint violation
+  return buffer->address + buffer->write_offset_bytes;
+}
+ 
+void
+ring_buffer_write_advance ( ring_buffer *buffer,
+                           unsigned long count_bytes)
+{
+  buffer->write_offset_bytes += count_bytes;
+}
+ 
+void *
+ring_buffer_read_address ( ring_buffer *buffer)
+{
+  return buffer->address + buffer->read_offset_bytes;
+}
+ 
+void
+ring_buffer_read_advance ( ring_buffer *buffer,
+                          unsigned long count_bytes)
+{
+  buffer->read_offset_bytes += count_bytes;
+ 
+  if (buffer->read_offset_bytes >= buffer->count_bytes)
+    {
+      buffer->read_offset_bytes -= buffer->count_bytes;
+      buffer->write_offset_bytes -= buffer->count_bytes;
     }
 }
  
-void cbWrite(CircularBuffer *cb, ElemType *elem) {
-    cb->elems[cb->end] = *elem;
-    if (cbIsFull(cb)) /* full, overwrite moves start pointer */
-        cbIncr(cb, &cb->start, &cb->s_msb);
-    cbIncr(cb, &cb->end, &cb->e_msb);
+unsigned long
+ring_buffer_count_bytes ( ring_buffer *buffer)
+{
+  return buffer->write_offset_bytes - buffer->read_offset_bytes;
 }
  
-void cbRead(CircularBuffer *cb, ElemType *elem) {
-    *elem = cb->elems[cb->start];
-    cbIncr(cb, &cb->start, &cb->s_msb);
+unsigned long
+ring_buffer_count_free_bytes ( ring_buffer *buffer)
+{
+  return buffer->count_bytes - ring_buffer_count_bytes (buffer);
 }
-
-
+ 
+void
+ring_buffer_clear ( ring_buffer *buffer)
+{
+  buffer->write_offset_bytes = 0;
+  buffer->read_offset_bytes = 0;
+}
 typedef struct Decoder{
     int stopped;
-    CircularBuffer* inputbuffer;
-    CircularBuffer* outputbuffer;
+    ring_buffer* inputbuffer;
+    ring_buffer* outputbuffer;
+    JNIEnv* env;
+    jobject thiz;
+    jmethodID pull;
+    jmethodID push;
+    jbyte* databuffer;
+    jbyte* audiobuffer;
 } Decoder;
 
 
@@ -144,37 +181,31 @@ void pull_data(Decoder *decoder){
 		ANDROID_LOG("decoder has no java input audiobuffer, creating one");
 		decoder->databuffer = (*env)->NewByteArray(env,AUDIO_INBUF_SIZE);
 	}
-    if(!decoder->datasrc){
-        ANDROID_LOG("decoder has no c input audiobuffer, creating one");
-        decoder->datasrc = calloc(1,AUDIO_INBUF_SIZE);
-        decoder->datasrc_size = 0;
-        decoder->datasrc_ptr = decoder->datasrc;
-    }
-    if(decoder->datasrc_size > 0){
-        memmove(decoder->datasrc, decoder->datasrc_ptr, decoder->datasrc_size);
-        decoder->datasrc_ptr = decoder->datasrc;
-	}
-    int max_len = AUDIO_INBUF_SIZE-decoder->datasrc_size;
-    int len = (*env)->CallIntMethod(env, decoder->thiz, decoder->pull, decoder->databuffer, 0, max_len);
+    ANDROID_LOG("ring_buffer_count_free_bytes %d",ring_buffer_count_free_bytes(decoder->inputbuffer));
+    //TODO wait conditional
+    while(ring_buffer_count_free_bytes(decoder->inputbuffer)<AUDIO_INBUF_SIZE);
+    ANDROID_LOG("yay no endless loop");
+    int len = (*env)->CallIntMethod(env, decoder->thiz, decoder->pull, decoder->databuffer, 0, AUDIO_INBUF_SIZE);
 	if(len > 0){
-        (*env)->GetByteArrayRegion(env, decoder->databuffer, 0, len,decoder->datasrc_ptr);
-        decoder->datasrc_size +=len;
+        (*env)->GetByteArrayRegion(env, decoder->databuffer, 0, len,ring_buffer_write_address(decoder->inputbuffer));
+        ring_buffer_write_advance(decoder->inputbuffer,len);
     }
 }
 
-void push_audio(Decoder* decoder, jbyte* decoded_output, int decoded){
+void push_audio(Decoder* decoder){
 	JNIEnv* env = decoder->env;
 	jint len,pushed = 0,attempts = 0;
-    ANDROID_LOG("push decoded of len %d",decoded);
+    ANDROID_LOG("push decoded");
 	if(!decoder->audiobuffer){
 		ANDROID_LOG("decoder has no java output audiobuffer, creating one");
-		decoder->audiobuffer = (*env)->NewByteArray(env,BUFFER_SIZE_IN_BYTES);
+		decoder->audiobuffer = (*env)->NewByteArray(env,AUDIO_OUTBUF_SIZE);
 	}
-    ANDROID_LOG("before copy");
-	(*env)->SetByteArrayRegion(env, decoder->audiobuffer, 0, decoded, decoded_output);
-    ANDROID_LOG("copied to java array");
-	while(!decoder->stopped && pushed < decoded){
-		len = (*env)->CallIntMethod(env, decoder->thiz, decoder->push, decoder->audiobuffer+pushed, 0,decoded-pushed);
+    //TODO wait conditional
+    while(ring_buffer_count_bytes(decoder->outputbuffer)<AUDIO_OUTBUF_SIZE);
+
+	(*env)->SetByteArrayRegion(env, decoder->audiobuffer, 0, AUDIO_OUTBUF_SIZE, ring_buffer_read_address(decoder->outputbuffer));
+	while(!decoder->stopped && pushed < AUDIO_OUTBUF_SIZE){
+		len = (*env)->CallIntMethod(env, decoder->thiz, decoder->push, decoder->audiobuffer+pushed, 0,AUDIO_OUTBUF_SIZE-pushed);
         ANDROID_LOG("sent to java");
 		if(len < 0 || attempts > MAX_PUSH_ATTEMPTS){
 			decoder->stopped = 1;
@@ -188,28 +219,27 @@ void push_audio(Decoder* decoder, jbyte* decoded_output, int decoded){
 
 
 //-----------------------------------------------------------------
-/* Callback for AndroidBufferQueueItf through which we supply ADTS buffers */
+// Callback for AndroidBufferQueueItf through which we supply ADTS buffers
 SLresult AndroidBufferQueueCallback(
         SLAndroidBufferQueueItf caller,
-        void *pCallbackContext,        /* input */
-        void *pBufferContext,          /* input */
-        void *pBufferData,             /* input */
-        SLuint32 dataSize,             /* input */
-        SLuint32 dataUsed,             /* input */
-        const SLAndroidBufferItem *pItems,/* input */
-        SLuint32 itemsLength           /* input */)
+        void *pCallbackContext,       
+        void *pBufferContext,         
+        void *pBufferData,          
+        SLuint32 dataSize,        
+        SLuint32 dataUsed,         
+        const SLAndroidBufferItem *pItems,
+        SLuint32 itemsLength          )
 {
     ANDROID_LOG("We need more aac");
     Decoder* decoder = (Decoder*)pCallbackContext;
-    if(decoder->datasrc_size < AUDIO_REFILL_THRESH){
-        ANDROID_LOG("refilling from java");
-        pull_data(decoder);
-    }
-    unsigned char* frame = decoder->datasrc_ptr;
+    //TODO wait conditional
+    while(ring_buffer_count_bytes(decoder->inputbuffer)<7);
+    unsigned char* frame = (unsigned char*)ring_buffer_read_address(decoder->inputbuffer);
     unsigned framelen = ((frame[3] & 3) << 11) | (frame[4] << 3) | (frame[5] >> 5);
+    //TODO wait conditional
+    while(ring_buffer_count_bytes(decoder->inputbuffer)<framelen);
     SLresult result = (*caller)->Enqueue(caller, NULL, frame, framelen, NULL, 0);
-    decoder->datasrc_ptr+=framelen;
-    decoder->datasrc_size-=framelen;
+    ring_buffer_read_advance(decoder->inputbuffer,framelen);
 
     return SL_RESULT_SUCCESS;
 }
@@ -222,29 +252,11 @@ void DecPlayCallback(
 {
     ANDROID_LOG("We have more pcm");
     Decoder *decoder = (Decoder*)pContext;
-    ANDROID_LOG("FAKED PUSH TO JAVA");
-    //push_audio(decoder,decoder->datasink_ptr,BUFFER_SIZE_IN_BYTES);
-
-    ANDROID_LOG("pushed the pcm to java");
-    /* Re-enqueue the now empty buffer */
-    SLresult result;
-    result = (*queueItf)->Enqueue(queueItf, decoder->datasink_ptr, BUFFER_SIZE_IN_BYTES);
-    ANDROID_LOG("enqueued an empty buffer");
-    /* Increase data pointer by buffer size, with circular wraparound */
-    decoder->datasink_ptr += BUFFER_SIZE_IN_BYTES;
-    if (decoder->datasink_ptr >= decoder->datasink + (NB_BUFFERS_IN_PCM_QUEUE * BUFFER_SIZE_IN_BYTES)) {
-        decoder->datasink_ptr = decoder->datasink;
-    }
-}
-
-
-
-
-
-static void log_error(char* str,int err){
-	char buf[1024];
-	av_strerror(err, buf, sizeof(buf));
-	ANDROID_LOG("%s: %s",str,buf);
+    ring_buffer_write_advance(decoder->outputbuffer,BUFFER_SIZE_IN_BYTES);
+    //TODO wait conditional
+    while(ring_buffer_count_free_bytes(decoder->outputbuffer) < BUFFER_SIZE_IN_BYTES);
+    SLresult result = (*queueItf)->Enqueue(queueItf,ring_buffer_write_address(decoder->outputbuffer), BUFFER_SIZE_IN_BYTES);
+    ANDROID_LOG("enqueued an empty buffer");   
 }
 
 /****************************************************************************************************
@@ -275,23 +287,19 @@ JNIEXPORT jint JNICALL Java_com_gangverk_AudioPlayer_startDecoding
 	jmethodID pull = (*env)->GetMethodID(env,cls, "pullData","([BII)I");
     jint retval = 1;
 
-	ANDROID_LOG("cached method ids");
-	if (push == 0 || pull == 0) return -1;
+    ring_buffer ring_input;
+    ring_buffer ring_output;
+    ring_buffer_create(&ring_input,16);
+    ring_buffer_create(&ring_output,16);
 
 	Decoder *decoder = (Decoder*)d;
-	decoder->env = env;
-	decoder->thiz = thiz;
-	decoder->stopped = 0;
-	decoder->push = push;
-	decoder->pull = pull;
-	decoder->block_start = -1;
-	decoder->audiobuffer = (*env)->NewByteArray(env,BUFFER_SIZE_IN_BYTES);
-	decoder->databuffer = (*env)->NewByteArray(env,AUDIO_INBUF_SIZE);
-    decoder->datasrc = NULL;
-    decoder->datasrc_ptr = NULL;
-    decoder->datasrc_size = 0;
-    decoder->datasink = calloc(NB_BUFFERS_IN_PCM_QUEUE,BUFFER_SIZE_IN_BYTES);
-    decoder->datasink_ptr = decoder->datasink;
+    decoder->inputbuffer = &ring_input;
+    decoder->outputbuffer = &ring_output;
+    decoder->env = env;
+    decoder->thiz = thiz;
+    decoder->stopped = 0;
+    decoder->push = push;
+    decoder->pull = pull;
 
     SLresult result;
     SLObjectItf sl = NULL;
@@ -414,20 +422,16 @@ JNIEXPORT jint JNICALL Java_com_gangverk_AudioPlayer_startDecoding
     }
 
     /* Enqueue buffers to map the region of memory allocated to store the decoded data */
-    //printf("Enqueueing initial empty buffers to receive decoded PCM data");
     for(i = 0 ; i < NB_BUFFERS_IN_PCM_QUEUE ; i++) {
-        //printf(" %d", i);
-        result = (*decBuffQueueItf)->Enqueue(decBuffQueueItf, decoder->datasink_ptr, BUFFER_SIZE_IN_BYTES);
+
+        result = (*decBuffQueueItf)->Enqueue(decBuffQueueItf, ring_buffer_write_address(decoder->outputbuffer), BUFFER_SIZE_IN_BYTES);
         if(SL_RESULT_SUCCESS != result){
             retval = -13;
             goto fail;
         }
-        decoder->datasink_ptr += BUFFER_SIZE_IN_BYTES;
-        if (decoder->datasink_ptr >= decoder->datasink + (NB_BUFFERS_IN_PCM_QUEUE * BUFFER_SIZE_IN_BYTES)) {
-            decoder->datasink_ptr = decoder->datasink;
-        }
+        ring_buffer_write_advance(decoder->outputbuffer,BUFFER_SIZE_IN_BYTES);
     }
-    //printf("\n");
+
 
     /* Initialize the callback for the Android buffer queue of the encoded data */
     result = (*aacBuffQueueItf)->RegisterCallback(aacBuffQueueItf, AndroidBufferQueueCallback, decoder);
@@ -438,30 +442,37 @@ JNIEXPORT jint JNICALL Java_com_gangverk_AudioPlayer_startDecoding
 
     /* Enqueue the content of our encoded data before starting to play,
        we don't want to starve the player initially */
-    //printf("Enqueueing initial full buffers of encoded ADTS data");
 
 	pull_data(decoder);
+    //TODO make this more robust, we are assuming enough data to fill NB_BUFFERS_IN_ADTS_QUEUE
     for (i=0 ; i < NB_BUFFERS_IN_ADTS_QUEUE ; i++) {
-        unsigned char* frame = decoder->datasrc_ptr;
+
+        unsigned char* frame = (unsigned char*)ring_buffer_read_address(decoder->inputbuffer);
         unsigned framelen = ((frame[3] & 3) << 11) | (frame[4] << 3) | (frame[5] >> 5);
-        result = (*aacBuffQueueItf)->Enqueue(aacBuffQueueItf, NULL /*pBufferContext*/,
+        result = (*aacBuffQueueItf)->Enqueue(aacBuffQueueItf, NULL,
                 frame, framelen, NULL, 0);
         if(SL_RESULT_SUCCESS != result){
             retval = -8;
             goto fail;
         }
-        decoder->datasrc_ptr += framelen;
-        decoder->datasrc_size -= framelen;
+        ring_buffer_read_advance(decoder->inputbuffer,framelen);
     }	    
     /* ------------------------------------------------------ */
     /* Start decoding */
-    //printf("Starting to decode\n");
     result = (*playItf)->SetPlayState(playItf, SL_PLAYSTATE_PLAYING);
     if(SL_RESULT_SUCCESS != result){
         retval = -9;
         goto fail;
     }
     //Hang around to perform push pull from java as possible
+    //TODO use wait conditionals
+    while(1){
+
+        pull_data(decoder);
+        
+        push_audio(decoder);
+        
+    }
 
     /* ------------------------------------------------------ */
     /* End of decoding */

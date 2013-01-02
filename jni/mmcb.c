@@ -1,6 +1,7 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <stdio.h>
 #include <unistd.h>
  
@@ -19,11 +20,12 @@ typedef struct
 void
 ring_buffer_create ( ring_buffer *buffer, unsigned long order)
 {
-  char path[] = "ring-buffer-XXXXXX";
+  char path[] = "/tmp/rbXXXXXX";
   int file_descriptor;
   void *address;
   int status;
  
+
   file_descriptor = mkstemp (path);
   if (file_descriptor < 0)
     report_exceptional_condition ();  
@@ -44,26 +46,23 @@ ring_buffer_create ( ring_buffer *buffer, unsigned long order)
  
   if (buffer->address == MAP_FAILED)
     report_exceptional_condition ();
-  printf("fd\n");
+  
   address =
     mmap (buffer->address, buffer->count_bytes, PROT_READ | PROT_WRITE,
-          MAP_FIXED | MAP_SHARED, file_descriptor, 0);
+          MAP_FIXED | MAP_PRIVATE, -1, 0);
  
   if (address != buffer->address)
     report_exceptional_condition ();
   
-  printf("before mmap\n");
   address = mmap (buffer->address + buffer->count_bytes,
                   buffer->count_bytes, PROT_READ | PROT_WRITE,
-                  MAP_FIXED | MAP_SHARED, file_descriptor, 0);
+                  MAP_FIXED | MAP_PRIVATE, -1, 0);
  
   if (address != buffer->address + buffer->count_bytes)
     report_exceptional_condition ();
-  printf("fd\n");
   status = close (file_descriptor);
   if (status)
     report_exceptional_condition ();
-  printf("fd\n");
 }
  
 void
@@ -133,18 +132,18 @@ int main(int argc, char **argv) {
     ring_buffer rb;
     int i = 0;
     char data[100] = "0abcdefghijklmnopqrstuvwxyz";
-    ring_buffer_create(&rb,1024);
+    ring_buffer_create(&rb,12);
     
-    for(i = 0; i < 30; i++){
+    while(ring_buffer_count_free_bytes(&rb) > 100){
       data[0] = i;
-      memcpy(data, ring_buffer_write_address(&rb),100);
+      memcpy(ring_buffer_write_address(&rb),data,100);
       ring_buffer_write_advance(&rb, 100);
-      printf("wrote %d round",i);
+      printf("wrote %d round\n",i++);
     }
     while(ring_buffer_count_bytes(&rb) > 0){
-      memcpy(ring_buffer_read_address(&rb),data,100);
+      memcpy(data,ring_buffer_read_address(&rb),100);
       ring_buffer_read_advance(&rb,100);
-      printf("%d\n",data[0]);
+      printf("%d:%d\n",data[0],data[1]);
     }
 
     ring_buffer_free(&rb);
