@@ -183,8 +183,12 @@ void pull_data(Decoder *decoder){
 	}
     ANDROID_LOG("ring_buffer_count_free_bytes %d",ring_buffer_count_free_bytes(decoder->inputbuffer));
     //TODO wait conditional
-    while(ring_buffer_count_free_bytes(decoder->inputbuffer)<AUDIO_INBUF_SIZE);
-    ANDROID_LOG("yay no endless loop");
+    if(ring_buffer_count_free_bytes(decoder->inputbuffer)<AUDIO_INBUF_SIZE){
+        ANDROID_LOG("waiting for more space to pull from java");
+        return;
+    }
+
+    ANDROID_LOG("done waiting for more space to pull from java");
     int len = (*env)->CallIntMethod(env, decoder->thiz, decoder->pull, decoder->databuffer, 0, AUDIO_INBUF_SIZE);
 	if(len > 0){
         (*env)->GetByteArrayRegion(env, decoder->databuffer, 0, len,ring_buffer_write_address(decoder->inputbuffer));
@@ -201,7 +205,12 @@ void push_audio(Decoder* decoder){
 		decoder->audiobuffer = (*env)->NewByteArray(env,AUDIO_OUTBUF_SIZE);
 	}
     //TODO wait conditional
-    while(ring_buffer_count_bytes(decoder->outputbuffer)<AUDIO_OUTBUF_SIZE);
+    
+    if(ring_buffer_count_bytes(decoder->outputbuffer)<AUDIO_OUTBUF_SIZE){
+        ANDROID_LOG("waiting for more bytes to push to java");
+        return;
+    }
+    ANDROID_LOG("done waiting for more bytes to push to java");
 
 	(*env)->SetByteArrayRegion(env, decoder->audiobuffer, 0, AUDIO_OUTBUF_SIZE, ring_buffer_read_address(decoder->outputbuffer));
 	while(!decoder->stopped && pushed < AUDIO_OUTBUF_SIZE){
@@ -215,6 +224,7 @@ void push_audio(Decoder* decoder){
 		pushed = pushed + len;
 		attempts = attempts+1;
 	}
+    ring_buffer_read_advance(decoder->outputbuffer,pushed);
 }
 
 
@@ -230,14 +240,16 @@ SLresult AndroidBufferQueueCallback(
         const SLAndroidBufferItem *pItems,
         SLuint32 itemsLength          )
 {
-    ANDROID_LOG("We need more aac");
     Decoder* decoder = (Decoder*)pCallbackContext;
     //TODO wait conditional
+    ANDROID_LOG("waiting for at least 7 bytes of aac");
     while(ring_buffer_count_bytes(decoder->inputbuffer)<7);
     unsigned char* frame = (unsigned char*)ring_buffer_read_address(decoder->inputbuffer);
     unsigned framelen = ((frame[3] & 3) << 11) | (frame[4] << 3) | (frame[5] >> 5);
     //TODO wait conditional
+    ANDROID_LOG("waiting for at least 1 frame");
     while(ring_buffer_count_bytes(decoder->inputbuffer)<framelen);
+    ANDROID_LOG("done waiting for at least 1 frame");
     SLresult result = (*caller)->Enqueue(caller, NULL, frame, framelen, NULL, 0);
     ring_buffer_read_advance(decoder->inputbuffer,framelen);
 
@@ -254,7 +266,9 @@ void DecPlayCallback(
     Decoder *decoder = (Decoder*)pContext;
     ring_buffer_write_advance(decoder->outputbuffer,BUFFER_SIZE_IN_BYTES);
     //TODO wait conditional
+    ANDROID_LOG("waiting for space before enqueueing empty buffer");
     while(ring_buffer_count_free_bytes(decoder->outputbuffer) < BUFFER_SIZE_IN_BYTES);
+    ANDROID_LOG("done waiting for space before enqueueing empty buffer");
     SLresult result = (*queueItf)->Enqueue(queueItf,ring_buffer_write_address(decoder->outputbuffer), BUFFER_SIZE_IN_BYTES);
     ANDROID_LOG("enqueued an empty buffer");   
 }
@@ -440,7 +454,9 @@ JNIEXPORT jint JNICALL Java_com_gangverk_AudioPlayer_startDecoding
         goto fail;
     }
 
-    /* Enqueue the content of our encoded data before starting to play,
+    /* Enqueue the content of our encoded data before starting to play
+
+
        we don't want to starve the player initially */
 
 	pull_data(decoder);
@@ -468,8 +484,10 @@ JNIEXPORT jint JNICALL Java_com_gangverk_AudioPlayer_startDecoding
     //TODO use wait conditionals
     while(1){
 
+        ANDROID_LOG("before pull data");
         pull_data(decoder);
         
+        ANDROID_LOG("before push audio");
         push_audio(decoder);
         
     }
